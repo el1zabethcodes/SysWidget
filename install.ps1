@@ -22,19 +22,21 @@ function Uninstall-Widget {
 if ($Uninstall) { Uninstall-Widget }
 
 New-Item -ItemType Directory -Path $dest -Force | Out-Null
-Write-Host "Скачиваю последний SysWidget.exe..." -ForegroundColor Cyan
-$api = "https://api.github.com/repos/$repo/releases/latest"
+Write-Host "Скачиваю SysWidget.exe..." -ForegroundColor Cyan
+$asset = $null; $tag = $null
 try {
-  $rel = Invoke-RestMethod $api
+  $rel = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
   $asset = $rel.assets | Where-Object { $_.name -eq 'SysWidget.exe' } | Select-Object -First 1
   $tag = $rel.tag_name
-} catch { $tag = $null }
-if (-not $asset) {
-  # no release yet -> build artifact from source is not possible here; fall back to main-branch binary if published, else fail with hint
-  Write-Error "Релиз не найден. Скачайте SysWidget.exe со страницы https://github.com/$repo/releases и запустите: SysWidget.exe --install"
+} catch {}
+if ($asset) {
+  Invoke-WebRequest $asset.browser_download_url -OutFile "$dest\SysWidget.exe"
+} else {
+  # no release yet: take the exe committed in the repo (main branch)
+  Invoke-WebRequest "https://raw.githubusercontent.com/$repo/main/bin/SysWidget.exe" -OutFile "$dest\SysWidget.exe"
+  $tag = 'main'
 }
-Invoke-WebRequest $asset.browser_download_url -OutFile "$dest\SysWidget.exe"
-Write-Host "Установлено: $dest\SysWidget.exe (v$tag)" -ForegroundColor Green
+Write-Host "Установлено: $dest\SysWidget.exe ($tag)" -ForegroundColor Green
 
 & "$dest\SysWidget.exe" --install
 Start-Sleep -Seconds 2
