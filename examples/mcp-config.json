@@ -1,0 +1,9 @@
+{
+  "_comment": "Пример регистрации SysWidget как MCP-сервера (ZCode / Claude Desktop / Cursor). Замените <user> на имя пользователя или укажите полный путь к вашему SysWidget.exe.",
+  "mcpServers": {
+    "syswidget": {
+      "command": "C:\\Users\\MMVIII\\AppData\\Local\\Programs\\SysWidget\\SysWidget.exe",
+      "args": ["--mcp"]
+    }
+  }
+}
