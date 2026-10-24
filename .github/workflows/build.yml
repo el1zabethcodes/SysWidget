@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WinLibs GCC
+        run: winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $gpp = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter g++.exe |
+                 Where-Object { $_.FullName -like '*mingw64*' } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $gpp) { throw "g++ not found" }
+          & $gpp -std=c++20 -O2 -municode -mwindows -Wall -Wextra -Wno-unused-parameter `
+            src/main.cpp -o bin/SysWidget.exe -static `
+            -ldwmapi -ld2d1 -ldwrite -ld3d11 -ldxgi -ldcomp `
+            -luuid -lole32 -loleaut32 -luser32 -lgdi32 -lshell32 -ladvapi32 -lshlwapi
+          Get-Item bin\SysWidget.exe | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SysWidget.exe
+          path: bin/SysWidget.exe
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/SysWidget.exe

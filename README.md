@@ -14,6 +14,14 @@
 └────────────────────────┘
 ```
 
+Виджет (реальный скриншот, 3× зум):
+
+![виджет](docs_default.png)
+
+Flyout по клику: графики CPU/RAM, текущие значения, кастомные строки:
+
+![flyout](docs_flyout.png)
+
 - Значения окрашиваются: >70% — жёлтый, >90% — красный (как в Linux-мониторах).
 - Акцентный цвет баров берётся из системной темы Windows.
 - Тема (светлая/тёмная), DPI и перезапуск explorer'а обрабатываются автоматически.
@@ -32,26 +40,33 @@
 
 ## Установка
 
-### В один шаг (Git Bash / PowerShell)
+### В одну команду (PowerShell)
 
-```bash
-# собрать и запустить
-./build.sh && ./bin/SysWidget.exe
-
-# + автозапуск вместе с Windows (HKCU\...\Run, без прав администратора):
-./bin/SysWidget.exe --install
-```
-
-Требуется `g++` (например `winget install BrechtSanders.WinLibs.POSIX.UCRT` —
-GCC/MinGW-w64 ставится одной командой) либо MSVC. Результат — единственный
-портативный `bin/SysWidget.exe`, можно скопировать в любое место и запускать оттуда.
-
-Рекомендуемое постоянное место:
+Скачивает готовый `SysWidget.exe` из [Releases](https://github.com/el1zabethcodes/SysWidget/releases),
+кладёт в `%LOCALAPPDATA%\Programs\SysWidget`, включает автозапуск и стартует виджет:
 
 ```powershell
-mkdir "$env:LOCALAPPDATA\Programs\SysWidget" -Force
-copy bin\SysWidget.exe "$env:LOCALAPPDATA\Programs\SysWidget\"
-& "$env:LOCALAPPDATA\Programs\SysWidget\SysWidget.exe" --install   # автозапуск + старт
+irm https://raw.githubusercontent.com/el1zabethcodes/SysWidget/main/install.ps1 | iex
+```
+
+Удаление:
+
+```powershell
+irm https://raw.githubusercontent.com/el1zabethcodes/SysWidget/main/install.ps1 -OutFile i.ps1; .\i.ps1 -Uninstall
+```
+
+Либо вручную: скачать `SysWidget.exe` из Releases → запустить → `SysWidget.exe --install` для автозапуска.
+Один портативный exe, никаких зависимостей и прав администратора.
+
+### Сборка из исходников
+
+Требуется `g++` (например `winget install BrechtSanders.WinLibs.POSIX.UCRT` —
+GCC/MinGW-w64 ставится одной командой) либо MSVC. На push в main сборка идёт
+автоматически в GitHub Actions (артефакт `SysWidget.exe`), на тег `v*` — публикуется в Releases.
+
+```bash
+./build.sh   # Git Bash
+build.bat    # cmd
 ```
 
 ### Замена штатной кнопки «Погода / Виджеты»
