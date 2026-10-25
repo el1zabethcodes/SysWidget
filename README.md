@@ -30,6 +30,25 @@ Flyout по клику: графики CPU/RAM, текущие значения,
 - Акцентный цвет баров берётся из системной темы Windows.
 - Тема (светлая/тёмная), DPI и перезапуск explorer'а обрабатываются автоматически.
 
+## Panel-режим и AI-агенты (v2.0)
+
+```bash
+# переключить в свободную панель с маскотом-GIF
+./bin/SysWidget.exe --send '{"cmd":"config","mode":"panel","mascotPath":"C:/anim.gif","mascotWidth":72}'
+# сообщить статус AI-агента (пайп \.\pipe\syswidget_agents_ipc или команда agent)
+./bin/SysWidget.exe --send '{"cmd":"agent","id":"claude","name":"Claude","status":"working","status_text":"Refactoring..."}'
+./bin/SysWidget.exe --send '{"cmd":"agent","id":"codex","name":"Codex","status":"done","status_text":"Build ok"}'
+./bin/SysWidget.exe --send '{"cmd":"agent","id":"gemini","name":"Gemini","status":"attention","status_text":"Needs approval"}'
+```
+
+Панель ресайзится за края мышкой, перетаскивается за шапку; карточки агентов
+(`working` — пульсирующий голубой, `done` — зелёный, `attention` — мигающий красный,
+`offline` — скрыт) выстраиваются стеком автоматически. MCP-инструмент
+`syswidget_status` и команды пайпа — без изменений. Цвета/радиусы/шрифты
+настраиваются в `%APPDATA%\SysWidget	heme.json`. Архитектура — [ARCHITECTURE.md](ARCHITECTURE.md).
+
+![панель](docs_panel.png)
+
 ## Состав
 
 | Файл | Назначение |

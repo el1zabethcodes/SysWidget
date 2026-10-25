@@ -7,9 +7,15 @@
 //  - "dcomp": D3D11 + DirectComposition + per-pixel-alpha swap chain
 //    (modern path; experimental on some systems).
 #pragma once
+#include <windowsx.h>
 #include "common.h"
 #include "content.h"
-#include "settings.h"
+#include "settings_window.h"
+#include "system/metrics.h"
+#include "ipc/agents.h"
+#include "graphics/wic_gif.h"
+#include "layout/layout.h"
+#include "config/theme.h"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -151,7 +157,7 @@ struct LayeredSurface {
 
 class WidgetUI {
  public:
-  bool create(SharedState& st);
+  bool create(SharedState& st, MetricsService* metrics, AgentService* agents);
   int run();
 
  private:
@@ -237,7 +243,18 @@ class WidgetUI {
   HWINEVENTHOOK hookFg_ = nullptr, hookReorder_ = nullptr;
 
   bool trayAbove(HWND tray) const;
-  static constexpr UINT TID_SAMPLE = 1, TID_ANIM = 2, TID_GLUE = 3;
+  bool isPanel() const;
+  void ensureGif();
+  layout::Anchor anchorFromCfg() const;
+  layout::Ptr buildCardTree();
+  layout::Ptr buildPanelTree();
+
+  RenderTheme theme_;
+  MetricsService* metrics_ = nullptr;
+  AgentService* agents_ = nullptr;
+  WicAnimatedGif gif_;
+  std::wstring gifPath_;
+  static constexpr UINT TID_ANIM = 2, TID_GLUE = 3, TID_GIF = 5;
 };
 
 // ---------------------------------------------------------------------------
@@ -293,8 +310,15 @@ inline HICON WidgetUI::makeTrayIcon() {
 }
 
 inline void WidgetUI::palette() {
-  light_ = IsLightTheme();
-  colAccent_ = GetAccentArgb();
+  theme_ = RenderTheme::load();
+  light_ = theme_.light;
+  colAccent_ = theme_.accent;
+  colWarn_ = theme_.warn;
+  colCrit_ = theme_.critical;
+  colPrimary_ = theme_.textPrimary;
+  colSecondary_ = theme_.textSecondary;
+  colCardStroke_ = theme_.cardStroke;
+  colTrack_ = theme_.track;
   int op = 8;
   if (st_) {
     AcquireSRWLockShared(&st_->lock);
@@ -302,19 +326,7 @@ inline void WidgetUI::palette() {
     ReleaseSRWLockShared(&st_->lock);
   }
   uint32_t a = (uint32_t)(std::min(100, std::max(0, op)) * 255 / 100);
-  if (light_) {
-    colPrimary_ = 0xE6000000;
-    colSecondary_ = 0x87000000;
-    colCardBg_ = a << 24;  // black tint
-    colCardStroke_ = 0x12000000;
-    colTrack_ = 0x1E000000;
-  } else {
-    colPrimary_ = 0xECFFFFFF;
-    colSecondary_ = 0x9EFFFFFF;
-    colCardBg_ = (a << 24) | 0x00FFFFFF;  // white tint
-    colCardStroke_ = 0x17FFFFFF;
-    colTrack_ = 0x24FFFFFF;
-  }
+  colCardBg_ = (a << 24) | (theme_.cardBg & 0xFFFFFF);
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +658,140 @@ inline void WidgetUI::drawChart(ID2D1RenderTarget* rt, float x, float y, float w
 }
 
 // ---------------------------------------------------------------------------
+inline bool WidgetUI::isPanel() const {
+  if (!st_) return false;
+  AcquireSRWLockShared(&st_->lock);
+  bool p = st_->cfg.mode == L"panel";
+  ReleaseSRWLockShared(&st_->lock);
+  return p;
+}
+
+inline layout::Anchor WidgetUI::anchorFromCfg() const {
+  std::wstring a;
+  AcquireSRWLockShared(&st_->lock);
+  a = st_->cfg.mascotAnchor;
+  ReleaseSRWLockShared(&st_->lock);
+  if (a == L"top-left") return layout::Anchor::TopLeft;
+  if (a == L"top-right") return layout::Anchor::TopRight;
+  if (a == L"center") return layout::Anchor::Center;
+  if (a == L"bottom-left") return layout::Anchor::BottomLeft;
+  return layout::Anchor::BottomRight;
+}
+
+inline void WidgetUI::ensureGif() {
+  std::wstring path;
+  double zoom = 1;
+  AcquireSRWLockShared(&st_->lock);
+  path = st_->cfg.mascotPath;
+  zoom = st_->cfg.mascotZoom;
+  ReleaseSRWLockShared(&st_->lock);
+  if (path.empty() || path == gifPath_) return;
+  ID2D1RenderTarget* rt = useDcomp() ? (ID2D1RenderTarget*)cctx_.get()
+                                     : (ID2D1RenderTarget*)crc_.get();
+  WicAnimatedGif tmp;
+  bool okLoad = rt && tmp.load(rt, path);
+  Trace("ensureGif load", (long)(okLoad ? 1 : 0), (long)tmp.width());
+  if (okLoad) {
+    gif_ = std::move(tmp);
+    gifPath_ = path;
+    (void)zoom;
+    SetTimer(card_, TID_GIF, gif_.current().delayMs, nullptr);
+    scheduleRender();
+  }
+}
+
+layout::Ptr WidgetUI::buildCardTree() {
+  ULONGLONG now = GetTickCount64();
+  bool vis[2] = {false, false};
+  LineView views[2];
+  int firstVis = -1;
+  {
+    AcquireSRWLockShared(&st_->lock);
+    for (int i = 0; i < 2; i++) {
+      vis[i] = st_->lines[i].kind != LineKind::Hidden;
+      if (vis[i] && firstVis < 0) firstVis = i;
+    }
+    for (int i = 0; i < 2; i++)
+      if (vis[i]) views[i] = buildLine(i, now, i == firstVis);
+    ReleaseSRWLockShared(&st_->lock);
+  }
+
+  auto v = layout::makeV(0);
+  v->padding(10, 4, 10, 4);
+  for (int i = 0; i < 2; i++) {
+    if (!vis[i]) continue;
+    LineView& v2 = views[i];
+    auto row = layout::makeH(7);
+    if (!v2.label.empty())
+      row->add(std::make_unique<layout::Text>(v2.label, fmtText_, colSecondary_));
+    row->add(std::make_unique<layout::Spacer>()).weight = 1;
+    if (!v2.value.empty())
+      row->add(std::make_unique<layout::Text>(
+          v2.value, fmtText_, v2.valueColor ? v2.valueColor : colPrimary_));
+    if (v2.hasBar) {
+      uint32_t fill = v2.valueColor ? v2.valueColor : colAccent_;
+      auto bar = std::make_unique<layout::Bar>(v2.bar, fill, colTrack_, 4.f);
+      row->add(std::move(bar));
+    }
+    row->child(row->count() - 1)->stretchCross = false;  // bars keep own height
+    v->add(std::move(row)).weight = 1;
+  }
+  return v;
+}
+
+layout::Ptr WidgetUI::buildPanelTree() {
+  SysStats stats;
+  {
+    AcquireSRWLockShared(&st_->lock);
+    stats = st_->stats;
+    ReleaseSRWLockShared(&st_->lock);
+  }
+  auto v = layout::makeV(8);
+  v->padding(12, 10, 12, 12);
+
+  auto header = layout::makeH(10);
+  header->add(std::make_unique<layout::Text>(L"SysWidget", fmtTitle_, theme_.textPrimary));
+  header->add(std::make_unique<layout::Spacer>()).weight = 1;
+  header->add(std::make_unique<layout::Text>(
+      WFmt(L"CPU %.0f%%", stats.cpuPercent), fmtText_, theme_.textPrimary));
+  header->add(std::make_unique<layout::Text>(
+      WFmt(L"RAM %.0f%%", stats.ramPercent), fmtText_, theme_.textPrimary));
+  v->add(std::move(header));
+  v->add(std::make_unique<layout::Spacer>()).userH = 2;
+
+  if (agents_) {
+    auto list = agents_->visible();
+    for (auto& a : list) {
+      auto card = std::make_unique<layout::AgentCard>(a, theme_.agentCardBg,
+                                                      theme_.textPrimary, theme_.textSecondary);
+      card->setBrush(backend_ == L"dcomp" ? brush_ : gbrush_);
+      card->setFormats(fmtText_, fmtSmall_);
+      card->setCvt(&ArgbToColor);
+      card->setWideCvt(&Utf8ToWide);
+      card->setColors(theme_.agentWorking, theme_.agentDone, theme_.agentAttention);
+      v->add(std::move(card));
+    }
+  }
+
+  if (gif_.ok()) {
+    float mw;
+    AcquireSRWLockShared(&st_->lock);
+    mw = (float)st_->cfg.mascotWidth;
+    ReleaseSRWLockShared(&st_->lock);
+    // bottom row: spacer pushes the fixed-size mascot to its anchor corner
+    auto bottom = layout::makeH(0);
+    bottom->add(std::make_unique<layout::Spacer>()).weight = 1;
+    auto g = std::make_unique<layout::Gif>(&gif_, mw / std::max(1.f, (float)gif_.width()),
+                                           anchorFromCfg());
+    g->stretchCross = false;
+    bottom->add(std::move(g));
+    v->add(std::move(bottom)).weight = 1;
+  } else {
+    v->add(std::make_unique<layout::Spacer>()).weight = 1;
+  }
+  return v;
+}
+
 inline void WidgetUI::renderCard() {
   if (cardW_ == 0 || cardH_ == 0) return;
   ID2D1RenderTarget* rt = nullptr;
@@ -661,95 +807,38 @@ inline void WidgetUI::renderCard() {
     rt = crc_;
     br = gbrush_;
   }
+  bool panel = isPanel();
 
-  ULONGLONG now = GetTickCount64();
-  LineView views[2];
-  bool vis[2] = {false, false};
-  std::wstring material;
-  int firstVis = -1;
-  {
-    AcquireSRWLockShared(&st_->lock);
-    material = st_->cfg.material;
-    for (int i = 0; i < 2; i++) {
-      vis[i] = st_->lines[i].kind != LineKind::Hidden;
-      if (vis[i] && firstVis < 0) firstVis = i;
-    }
-    for (int i = 0; i < 2; i++)
-      if (vis[i]) views[i] = buildLine(i, now, i == firstVis);
-    ReleaseSRWLockShared(&st_->lock);
-  }
-  if (!vis[0] && !vis[1]) {
-    if (cardVisible_) {
-      ShowWindow(card_, SW_HIDE);
-      cardVisible_ = false;
-    }
-    return;
-  }
+  layout::Text::setFactory(dwf_, &ArgbToColor);
+  layout::Text::setSharedBrush(br);
+  layout::Bar::setCvt(&ArgbToColor);
+
+  float scale = scale_;
+  layout::Ptr tree = panel ? buildPanelTree() : buildCardTree();
+  static_cast<layout::Stack*>(tree.get())->setScale(scale);
 
   rt->BeginDraw();
   rt->Clear(D2D1::ColorF(0, 0, 0, 0));
 
   float W = (float)cardW_, H = (float)cardH_;
-  float corner = 6.f * scale_;
-  if (material != L"flat") {
-    uint32_t bg = colCardBg_;
-    if (hoverCard_) {
-      uint32_t al = (bg >> 24) + 10;
-      if (al > 255) al = 255;
-      bg = (al << 24) | (bg & 0xFFFFFF);
-    }
+  float radius = (panel ? theme_.radiusWindow : theme_.radiusCards) * scale;
+  uint32_t bg = panel ? theme_.windowBg : colCardBg_;
+  if (!panel && hoverCard_) {
+    uint32_t al = (bg >> 24) + 10;
+    if (al > 255) al = 255;
+    bg = (al << 24) | (bg & 0xFFFFFF);
+  }
+  if (bg >> 24) {
     br->SetColor(ArgbToColor(bg));
-    rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, W, H), corner, corner), br);
-    br->SetColor(ArgbToColor(colCardStroke_));
+    rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, W, H), radius, radius), br);
+    br->SetColor(ArgbToColor(theme_.cardStroke));
     rt->DrawRoundedRectangle(
-        D2D1::RoundedRect(D2D1::RectF(0.5f, 0.5f, W - 0.5f, H - 0.5f), corner, corner), br, 1.f);
+        D2D1::RoundedRect(D2D1::RectF(0.5f, 0.5f, W - 0.5f, H - 0.5f), radius, radius), br, 1.f);
   }
 
-  float padX = 10.f * scale_;
-  float padY = 4.f * scale_;
-  int nVis = (vis[0] ? 1 : 0) + (vis[1] ? 1 : 0);
-  float lineH = (H - 2 * padY) / (float)(nVis > 0 ? nVis : 1);
-  float iconSize = 11.f * scale_;
-  int row = 0;
-
-  for (int i = 0; i < 2; i++) {
-    if (!vis[i]) continue;
-    LineView& v = views[i];
-    float yTop = padY + row * lineH;
-    row++;
-    float right = W - padX;
-    float x = padX;
-
-    if (!v.icon.empty()) {
-      br->SetColor(ArgbToColor(v.valueColor ? v.valueColor : (colAccent_ | 0xFF000000u)));
-      rt->DrawTextW(v.icon.c_str(), (UINT32)v.icon.size(), fmtIcon_,
-                    D2D1::RectF(x, yTop, x + iconSize * 2.2f, yTop + lineH), br);
-      x += measure(fmtIcon_, v.icon) + 6.f * scale_;
-    }
-    if (!v.label.empty()) {
-      float lw = measure(fmtText_, v.label);
-      br->SetColor(ArgbToColor(colSecondary_));
-      rt->DrawTextW(v.label.c_str(), (UINT32)v.label.size(), fmtText_,
-                    D2D1::RectF(x, yTop, x + lw + 2, yTop + lineH), br);
-      x += lw + 7.f * scale_;
-    }
-
-    float barW = 28.f * scale_;
-    float barH = 4.f * scale_;
-    float barX = right - barW;
-    float anchorRight = v.hasBar ? barX - 8.f * scale_ : right;
-
-    if (!v.value.empty()) {
-      float vw = measure(fmtText_, v.value);
-      if (vw > anchorRight - x) vw = anchorRight - x;
-      br->SetColor(ArgbToColor(v.valueColor ? v.valueColor : colPrimary_));
-      rt->DrawTextW(v.value.c_str(), (UINT32)v.value.size(), fmtText_,
-                    D2D1::RectF(anchorRight - vw, yTop, anchorRight, yTop + lineH), br);
-    }
-    if (v.hasBar)
-      drawBar(rt, barX, yTop + lineH / 2.f - barH / 2.f, barW, barH, v.bar,
-              ArgbToColor(v.valueColor ? v.valueColor : (colAccent_ | 0xFF000000u)));
-  }
+  tree->measure(W, H, scale);
+  tree->arrange({0, 0, W, H});
+  tree->render(rt, theme_, scale);
 
   rt->EndDraw();
   presentCard();
@@ -867,6 +956,25 @@ inline void WidgetUI::renderFlyout() {
     if (++shown >= 3) break;
   }
 
+  // AI agents (same card renderer as the panel)
+  if (agents_) {
+    auto list = agents_->visible();
+    int shown = 0;
+    for (auto& a : list) {
+      if (shown >= 4) break;
+      layout::AgentCard card(a, theme_.agentCardBg, theme_.textPrimary, theme_.textSecondary);
+      card.setBrush(br);
+      card.setFormats(fmtText_, fmtSmall_);
+      card.setCvt(&ArgbToColor);
+      card.setWideCvt(&Utf8ToWide);
+      card.setColors(theme_.agentWorking, theme_.agentDone, theme_.agentAttention);
+      card.arrange({pad, y, W - 2 * pad, 30.f * scale_});
+      card.render(rt, theme_, scale_);
+      y += 34.f * scale_;
+      shown++;
+    }
+  }
+
   float fy = H - pad - 14 * scale_;
   text(L"\\\\.\\pipe\\SysWidget · MCP ready", fmtSmall_,
        D2D1::RectF(pad, fy, W - pad, fy + 16 * scale_), colSecondary_);
@@ -886,6 +994,40 @@ bool WidgetUI::trayAbove(HWND tray) const {
 }
 
 inline void WidgetUI::glue(bool force) {
+  if (isPanel()) {
+    // free-floating resizable panel: position from config (auto = bottom-right)
+    int px, py, pw, ph;
+    AcquireSRWLockShared(&st_->lock);
+    px = st_->cfg.panelX; py = st_->cfg.panelY;
+    pw = st_->cfg.panelW; ph = st_->cfg.panelH;
+    ReleaseSRWLockShared(&st_->lock);
+    UINT w = (UINT)(pw * scale_), h = (UINT)(ph * scale_);
+    // anchor to the primary taskbar's monitor — card_ is born at (-2000,-2000)
+    HMONITOR mon = MonitorFromWindow(FindWindowW(L"Shell_TrayWnd", nullptr),
+                                     MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(mon, &mi);
+    int x = px >= 0 ? (int)(px * scale_) : mi.rcWork.right - (int)w - 12;
+    int y = py >= 0 ? (int)(py * scale_) : mi.rcWork.bottom - (int)h - 12;
+    RECT want{x, y, x + (int)w, y + (int)h};
+    RECT cur{};
+    bool haveCur = GetWindowRect(card_, &cur) != FALSE;
+    if (force || !haveCur || !EqualRect(&want, &cur) || (UINT)(want.right - want.left) != cardW_ ||
+        (UINT)(want.bottom - want.top) != cardH_ || !cardVisible_) {
+      cardW_ = want.right - want.left;
+      cardH_ = want.bottom - want.top;
+      SetWindowPos(card_, HWND_TOPMOST, x, y, (int)cardW_, (int)cardH_,
+                   SWP_NOACTIVATE | SWP_SHOWWINDOW);
+      GetWindowRect(card_, &cardRect_);
+      cardVisible_ = true;
+      if (crc_) ensureCardSurface();  // gdi backend only; dcomp resizes elsewhere
+      scheduleRender();
+    }
+    if (cardVisible_ && trayAbove(FindWindowW(L"Shell_TrayWnd", nullptr)))
+      SetWindowPos(card_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    return;
+  }
   HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
   if (!tray) {
     if (cardVisible_) { ShowWindow(card_, SW_HIDE); cardVisible_ = false; }
@@ -1093,9 +1235,13 @@ inline void WidgetUI::trayMenu() {
 }
 
 // ---------------------------------------------------------------------------
-inline bool WidgetUI::create(SharedState& st) {
+inline bool WidgetUI::create(SharedState& st, MetricsService* metrics, AgentService* agents) {
   st_ = &st;
+  metrics_ = metrics;
+  agents_ = agents;
+  Trace("create: begin");
   palette();
+  Trace("create: palette done");
 
   {
     AcquireSRWLockShared(&st_->lock);
@@ -1116,6 +1262,7 @@ inline bool WidgetUI::create(SharedState& st) {
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   RegisterClassW(&wc);
 
+  Trace("create: pre-CreateWindow");
   card_ = CreateWindowExW(exCard, L"SysWidgetCard", L"SysWidget", WS_POPUP, -2000, -2000, 160,
                           40, nullptr, nullptr, GetModuleHandleW(nullptr), this);
   if (!card_) {
@@ -1127,13 +1274,18 @@ inline bool WidgetUI::create(SharedState& st) {
   cardW_ = 160;
   cardH_ = 40;
 
+  Trace("create: window done");
   if (!initBackend()) return false;
+  Trace("create: backend done");
 
   msgTaskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
 
-  SetTimer(card_, TID_SAMPLE, 1000, nullptr);
   SetTimer(card_, TID_ANIM, 100, nullptr);
   SetTimer(card_, TID_GLUE, 1000, nullptr);
+  if (metrics_) metrics_->start(card_, st_);  // background sampling + WM_APP_DATA_UPDATED
+  Trace("create: metrics started");
+  if (getenv("SYSWIDGET_NOGIF") == nullptr) ensureGif();
+  Trace("create: gif done");
 
   g_raiseCard = card_;
   g_raiseTray = FindWindowW(L"Shell_TrayWnd", nullptr);
@@ -1178,20 +1330,13 @@ inline LRESULT WidgetUI::cardHandler(UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_TIMER:
       switch ((UINT)wp) {
-        case TID_SAMPLE: {
-          SysStats s;
-          static Sampler sampler;  // single UI-thread sampler
-          sampler.sample(s);
-          AcquireSRWLockExclusive(&st_->lock);
-          st_->stats = s;
-          st_->histCpu.push_back(s.cpuPercent);
-          st_->histRam.push_back(s.ramPercent);
-          while (st_->histCpu.size() > 120) st_->histCpu.pop_front();
-          while (st_->histRam.size() > 120) st_->histRam.pop_front();
-          ReleaseSRWLockExclusive(&st_->lock);
-          scheduleRender();
-          if (flyOpen_) renderFlyout();
-          break;
+        case TID_GIF: {
+          if (gif_.ok()) {
+            DWORD d = gif_.advance();
+            SetTimer(card_, TID_GIF, d, nullptr);
+            renderCard();
+          }
+          return 0;
         }
         case TID_ANIM: {
           if (st_->quit.load(std::memory_order_relaxed)) {
@@ -1271,9 +1416,66 @@ inline LRESULT WidgetUI::cardHandler(UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_APP_CFGCHANGED:
+      ensureGif();
       glue(true);
       renderCard();
       return 0;
+
+    case WM_APP_DATA_UPDATED:
+      scheduleRender();
+      if (flyOpen_) renderFlyout();
+      return 0;
+
+    case WM_NCHITTEST: {
+      if (!isPanel()) break;
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      ScreenToClient(card_, &pt);
+      RECT rc;
+      GetClientRect(card_, &rc);
+      float m = 7.f * scale_;
+      bool L = pt.x < m, R = pt.x > rc.right - m, T = pt.y < m, B = pt.y > rc.bottom - m;
+      if (T && L) return HTTOPLEFT;
+      if (T && R) return HTTOPRIGHT;
+      if (B && L) return HTBOTTOMLEFT;
+      if (B && R) return HTBOTTOMRIGHT;
+      if (L) return HTLEFT;
+      if (R) return HTRIGHT;
+      if (T) return HTTOP;
+      if (B) return HTBOTTOM;
+      if (pt.y < 30 * scale_) return HTCAPTION;  // header drag zone
+      return HTCLIENT;
+    }
+
+    case WM_GETMINMAXINFO: {
+      if (!isPanel()) break;
+      auto* mmi = (MINMAXINFO*)lp;
+      mmi->ptMinTrackSize = {(LONG)(240 * scale_), (LONG)(150 * scale_)};
+      mmi->ptMaxTrackSize = {(LONG)(1400 * scale_), (LONG)(2000 * scale_)};
+      return 0;
+    }
+
+    case WM_SIZE:
+      if (isPanel() && wp != SIZE_MINIMIZED && (crc_ || cctx_)) {  // backend must exist
+        cardW_ = LOWORD(lp);
+        cardH_ = HIWORD(lp);
+        ensureCardSurface();
+        scheduleRender();
+      }
+      return 0;
+
+    case WM_EXITSIZEMOVE: {
+      if (!isPanel()) break;
+      RECT r;
+      if (GetWindowRect(card_, &r)) {
+        AcquireSRWLockExclusive(&st_->lock);
+        st_->cfg.panelX = r.left; st_->cfg.panelY = r.top;
+        st_->cfg.panelW = (int)((r.right - r.left) / scale_);
+        st_->cfg.panelH = (int)((r.bottom - r.top) / scale_);
+        ReleaseSRWLockExclusive(&st_->lock);
+        SaveConfig(*st_);
+      }
+      return 0;
+    }
 
     case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
@@ -1320,6 +1522,8 @@ inline LRESULT WidgetUI::cardHandler(UINT msg, WPARAM wp, LPARAM lp) {
       if (trayIcon_) DestroyIcon(trayIcon_);
       toggleFlyout(false);
       settings_.requestClose();
+      if (metrics_) metrics_->stop();
+      gif_.clear();
       if (hookFg_) UnhookWinEvent(hookFg_);
       if (hookReorder_) UnhookWinEvent(hookReorder_);
       hookFg_ = hookReorder_ = nullptr;

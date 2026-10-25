@@ -27,7 +27,7 @@ jobs:
         run: |
           mkdir -p bin
           g++ -std=c++20 -O2 -municode -mwindows -Wall -Wextra -Wno-unused-parameter \
-            src/main.cpp -o bin/SysWidget.exe -static \
+            src/main.cpp -o bin/SysWidget.exe -Isrc -static \
             -ldwmapi -ld2d1 -ldwrite -ld3d11 -ldxgi -ldcomp \
             -luuid -lole32 -loleaut32 -luser32 -lgdi32 -lshell32 -ladvapi32 -lshlwapi -lcomctl32 -luxtheme
           ls -la bin/SysWidget.exe

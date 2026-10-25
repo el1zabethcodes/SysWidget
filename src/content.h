@@ -3,10 +3,14 @@
 #pragma once
 #include "common.h"
 #include "jsonlite.h"
-#include "sampler.h"
+#include "system/sampler.h"
 
 #include <atomic>
+#include <functional>
 #include <thread>
+
+class MetricsService;   // system/metrics.h
+class AgentService;     // ipc/agents.h
 
 enum class LineKind { Cpu, Ram, Text, Anim, Script, Hidden };
 
@@ -41,6 +45,13 @@ struct Config {
   std::wstring material = L"card";    // card | flat | acrylic
   std::wstring renderer = L"auto";    // auto | gdi (ULW+D2D) | dcomp
   int bgOpacity = 8;                  // 0..100, card background alpha in %
+  std::wstring mode = L"taskbar";     // taskbar (glued card) | panel (free resizable)
+  std::wstring mascotPath;            // animated GIF for the panel mascot
+  int mascotWidth = 96;               // px @96dpi
+  std::wstring mascotAnchor = L"bottom-right";
+  double mascotZoom = 1.0;
+  int panelW = 320, panelH = 380;     // panel mode size @96dpi
+  int panelX = -1, panelY = -1;       // -1 = auto (bottom-right above taskbar)
   bool trayIcon = true;
 };
 
@@ -55,6 +66,7 @@ struct SharedState {
   HWND cardHwnd = nullptr;  // set by UI thread before workers post messages
   std::atomic<bool> dirty{true};
   std::atomic<bool> quit{false};
+  std::function<void(const Json&)> onAgent;  // set by main: AgentService::apply
 
   SharedState() {
     lines[0].kind = LineKind::Cpu;
@@ -133,6 +145,13 @@ inline void SaveConfig(SharedState& st) {
      .set("material", WideToUtf8(st.cfg.material))
      .set("renderer", WideToUtf8(st.cfg.renderer))
      .set("bgOpacity", (double)st.cfg.bgOpacity)
+     .set("mode", WideToUtf8(st.cfg.mode))
+     .set("mascotPath", WideToUtf8(st.cfg.mascotPath))
+     .set("mascotWidth", (double)st.cfg.mascotWidth)
+     .set("mascotAnchor", WideToUtf8(st.cfg.mascotAnchor))
+     .set("mascotZoom", st.cfg.mascotZoom)
+     .set("panelW", (double)st.cfg.panelW).set("panelH", (double)st.cfg.panelH)
+     .set("panelX", (double)st.cfg.panelX).set("panelY", (double)st.cfg.panelY)
      .set("trayIcon", st.cfg.trayIcon);
   Json lines;
   SerializeLines(st.lines, lines);
@@ -196,6 +215,17 @@ inline void LoadConfig(SharedState& st) {
     if (cfg->has("renderer")) st.cfg.renderer = Utf8ToWide(cfg->getStr("renderer", "auto"));
     if (cfg->has("bgOpacity"))
       st.cfg.bgOpacity = (int)std::min(100.0, std::max(0.0, cfg->getNum("bgOpacity", 8)));
+    if (cfg->has("mode")) st.cfg.mode = Utf8ToWide(cfg->getStr("mode", "taskbar"));
+    if (cfg->has("mascotPath")) st.cfg.mascotPath = Utf8ToWide(cfg->getStr("mascotPath", ""));
+    if (cfg->has("mascotWidth"))
+      st.cfg.mascotWidth = (int)std::min(320.0, std::max(32.0, cfg->getNum("mascotWidth", 96)));
+    if (cfg->has("mascotAnchor")) st.cfg.mascotAnchor = Utf8ToWide(cfg->getStr("mascotAnchor", "bottom-right"));
+    if (cfg->has("mascotZoom"))
+      st.cfg.mascotZoom = std::min(4.0, std::max(0.1, cfg->getNum("mascotZoom", 1.0)));
+    if (cfg->has("panelW")) st.cfg.panelW = (int)std::min(1200.0, std::max(240.0, cfg->getNum("panelW", 320)));
+    if (cfg->has("panelH")) st.cfg.panelH = (int)std::min(1600.0, std::max(150.0, cfg->getNum("panelH", 380)));
+    if (cfg->has("panelX")) st.cfg.panelX = (int)cfg->getNum("panelX", -1);
+    if (cfg->has("panelY")) st.cfg.panelY = (int)cfg->getNum("panelY", -1);
     if (cfg->has("trayIcon")) st.cfg.trayIcon = cfg->getBool("trayIcon", true);
   }
   const Json* lines = root.find("lines");
@@ -454,6 +484,13 @@ inline std::string ApplyCommand(SharedState& st, const Json& req) {
        .set("material", WideToUtf8(st.cfg.material))
        .set("renderer", WideToUtf8(st.cfg.renderer))
        .set("bgOpacity", (double)st.cfg.bgOpacity)
+       .set("mode", WideToUtf8(st.cfg.mode))
+       .set("mascotPath", WideToUtf8(st.cfg.mascotPath))
+       .set("mascotWidth", (double)st.cfg.mascotWidth)
+       .set("mascotAnchor", WideToUtf8(st.cfg.mascotAnchor))
+       .set("mascotZoom", st.cfg.mascotZoom)
+       .set("panelW", (double)st.cfg.panelW).set("panelH", (double)st.cfg.panelH)
+       .set("panelX", (double)st.cfg.panelX).set("panelY", (double)st.cfg.panelY)
        .set("trayIcon", st.cfg.trayIcon);
     Json r = Json::o().set("ok", true).set("lines", lines).set("config", cfg);
     if (st.note.active) r.set("notify", WideToUtf8(st.note.text));
@@ -645,16 +682,38 @@ inline std::string ApplyCommand(SharedState& st, const Json& req) {
     if (req.has("renderer")) st.cfg.renderer = Utf8ToWide(req.getStr("renderer", "auto"));
     if (req.has("bgOpacity"))
       st.cfg.bgOpacity = (int)std::min(100.0, std::max(0.0, req.getNum("bgOpacity", 8)));
+    if (req.has("mode")) {
+      std::string m = req.getStr("mode", "taskbar");
+      if (m == "panel" || m == "taskbar") st.cfg.mode = Utf8ToWide(m);
+    }
+    if (req.has("mascotPath")) st.cfg.mascotPath = Utf8ToWide(req.getStr("mascotPath", ""));
+    if (req.has("mascotWidth"))
+      st.cfg.mascotWidth = (int)std::min(320.0, std::max(32.0, req.getNum("mascotWidth", 96)));
+    if (req.has("mascotAnchor")) st.cfg.mascotAnchor = Utf8ToWide(req.getStr("mascotAnchor", "bottom-right"));
+    if (req.has("mascotZoom"))
+      st.cfg.mascotZoom = std::min(4.0, std::max(0.1, req.getNum("mascotZoom", 1.0)));
+    if (req.has("panelW")) st.cfg.panelW = (int)std::min(1200.0, std::max(240.0, req.getNum("panelW", 320)));
+    if (req.has("panelH")) st.cfg.panelH = (int)std::min(1600.0, std::max(150.0, req.getNum("panelH", 380)));
+    if (req.has("panelX")) st.cfg.panelX = (int)req.getNum("panelX", -1);
+    if (req.has("panelY")) st.cfg.panelY = (int)req.getNum("panelY", -1);
     if (req.has("trayIcon")) st.cfg.trayIcon = req.getBool("trayIcon", true);
     ReleaseSRWLockExclusive(&st.lock);
     st.dirty.store(true, std::memory_order_relaxed);
     SaveConfig(st);
+    // mode/mascot/size changes need UI-side action (glue, gif load), not just re-render
+    if (st.cardHwnd) PostMessageW(st.cardHwnd, WM_APP_CFGCHANGED, 0, 0);
     return Json::o().set("ok", true).dump();
   }
 
   if (cmd == "save") {
     SaveConfig(st);
     return Json::o().set("ok", true).set("path", WideToUtf8(ConfigPath())).dump();
+  }
+
+  if (cmd == "agent") {
+    if (!st.onAgent) return ErrResp("agent service unavailable");
+    st.onAgent(req);
+    return Json::o().set("ok", true).dump();
   }
 
   if (cmd == "hide" || cmd == "show" || cmd == "exit") {

@@ -4,7 +4,7 @@
 #pragma once
 #include "common.h"
 #include "jsonlite.h"
-#include "pipe.h"
+#include "pipe_server.h"
 
 namespace mcp {
 

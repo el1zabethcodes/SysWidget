@@ -2,13 +2,25 @@
 // (NDJSON) and an MCP stdio bridge. Single portable executable.
 #include "common.h"
 #include "jsonlite.h"
-#include "sampler.h"
+#include "system/sampler.h"
+#include "system/metrics.h"
+#include "ipc/agents.h"
 #include "content.h"
-#include "pipe.h"
-#include "mcp.h"
-#include "ui.h"
+#include "ipc/pipe_server.h"
+#include "ipc/mcp.h"
+#include "ui/card_window.h"
+#include <timeapi.h>
 
 #include <atomic>
+#include <csignal>
+#include <exception>
+
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* e) {
+  uintptr_t a = (uintptr_t)e->ExceptionRecord->ExceptionAddress;
+  Trace("EXCEPTION", (long)e->ExceptionRecord->ExceptionCode, (long)(a & 0xFFFFFFFF));
+  Trace("EXC_ADDR_HI", (long)(a >> 32), 0);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
 
 static void PrintUsage() {
   CliPrint(L"SysWidget " + Utf8ToWide(kVersion) +
@@ -74,6 +86,9 @@ static void SpawnDetachedSelf() {
 }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+  SetUnhandledExceptionFilter(CrashFilter);
+  std::set_terminate([] { Trace("std::terminate called"); });
+  signal(SIGABRT, [](int) { Trace("SIGABRT"); });
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   std::vector<std::wstring> args;
@@ -198,6 +213,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   }
 
   {
+    timeBeginPeriod(1);  // sharpen GIF/anim timers
+
     SharedState st;
     LoadConfig(st);
 
@@ -207,9 +224,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     ScriptRunner scripts(st);
     scripts.start();
 
+    Trace("main: services begin");
+    MetricsService metrics;
+    AgentService agents;
+    st.onAgent = [&agents](const Json& j) { agents.apply(j); };
+    Trace("main: services done");
+
     int rc = 0;
     WidgetUI ui;
-    if (ui.create(st)) {
+    if (ui.create(st, &metrics, &agents)) {
       Trace("ui created, entering loop");
       rc = ui.run();
       Trace("loop done");
@@ -220,8 +243,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     st.quit.store(true, std::memory_order_relaxed);
+    metrics.stop();
+    agents.stop();
     scripts.join();
     PipeServerStop();
+    timeEndPeriod(1);
     CoUninitialize();
     if (mutex) ReleaseMutex(mutex);
     return rc;

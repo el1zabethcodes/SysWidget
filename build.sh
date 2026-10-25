@@ -19,8 +19,8 @@ fi
 mkdir -p bin
 echo "[build] $GPP"
 "$GPP" -std=c++20 -O2 -municode -mwindows -Wall -Wextra -Wno-unused-parameter \
-  src/main.cpp -o bin/SysWidget.exe \
-  -static \
+  src/main.cpp -o bin/SysWidget.exe -Isrc \
+  -static -Wl,--disable-dynamicbase \
   -ldwmapi -ld2d1 -ldwrite -ld3d11 -ldxgi -ldcomp \
-  -luuid -lole32 -loleaut32 -luser32 -lgdi32 -lshell32 -ladvapi32 -lshlwapi -lcomctl32 -luxtheme
+  -luuid -lole32 -loleaut32 -luser32 -lgdi32 -lshell32 -ladvapi32 -lshlwapi -lcomctl32 -luxtheme -lwindowscodecs -lwinmm
 echo "[ok] bin/SysWidget.exe"
