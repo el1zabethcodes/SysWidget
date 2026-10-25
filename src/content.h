@@ -8,7 +8,7 @@
 #include <atomic>
 #include <thread>
 
-enum class LineKind { Cpu, Ram, Text, Anim, Script };
+enum class LineKind { Cpu, Ram, Text, Anim, Script, Hidden };
 
 struct LineSpec {
   LineKind kind = LineKind::Text;
@@ -40,6 +40,7 @@ struct Config {
   std::wstring align = L"left";       // left | right corner of the taskbar
   std::wstring material = L"card";    // card | flat | acrylic
   std::wstring renderer = L"auto";    // auto | gdi (ULW+D2D) | dcomp
+  int bgOpacity = 8;                  // 0..100, card background alpha in %
   bool trayIcon = true;
 };
 
@@ -68,6 +69,7 @@ inline const wchar_t* LineKindName(LineKind k) {
     case LineKind::Text: return L"text";
     case LineKind::Anim: return L"anim";
     case LineKind::Script: return L"script";
+    case LineKind::Hidden: return L"hidden";
   }
   return L"text";
 }
@@ -78,6 +80,7 @@ inline bool LineKindFromName(const std::string& s, LineKind& k) {
   if (s == "text") { k = LineKind::Text; return true; }
   if (s == "anim") { k = LineKind::Anim; return true; }
   if (s == "script") { k = LineKind::Script; return true; }
+  if (s == "hidden") { k = LineKind::Hidden; return true; }
   return false;
 }
 
@@ -129,6 +132,7 @@ inline void SaveConfig(SharedState& st) {
      .set("align", WideToUtf8(st.cfg.align))
      .set("material", WideToUtf8(st.cfg.material))
      .set("renderer", WideToUtf8(st.cfg.renderer))
+     .set("bgOpacity", (double)st.cfg.bgOpacity)
      .set("trayIcon", st.cfg.trayIcon);
   Json lines;
   SerializeLines(st.lines, lines);
@@ -190,6 +194,8 @@ inline void LoadConfig(SharedState& st) {
     if (cfg->has("align")) st.cfg.align = Utf8ToWide(cfg->getStr("align", "left"));
     if (cfg->has("material")) st.cfg.material = Utf8ToWide(cfg->getStr("material", "card"));
     if (cfg->has("renderer")) st.cfg.renderer = Utf8ToWide(cfg->getStr("renderer", "auto"));
+    if (cfg->has("bgOpacity"))
+      st.cfg.bgOpacity = (int)std::min(100.0, std::max(0.0, cfg->getNum("bgOpacity", 8)));
     if (cfg->has("trayIcon")) st.cfg.trayIcon = cfg->getBool("trayIcon", true);
   }
   const Json* lines = root.find("lines");
@@ -357,6 +363,8 @@ inline std::wstring LineViewText(const LineSpec& L, const SysStats& st, ULONGLON
     }
     case LineKind::Script:
       return L.scriptOutput;
+    case LineKind::Hidden:
+      return L"";
   }
   return L"";
 }
@@ -445,6 +453,7 @@ inline std::string ApplyCommand(SharedState& st, const Json& req) {
        .set("align", WideToUtf8(st.cfg.align))
        .set("material", WideToUtf8(st.cfg.material))
        .set("renderer", WideToUtf8(st.cfg.renderer))
+       .set("bgOpacity", (double)st.cfg.bgOpacity)
        .set("trayIcon", st.cfg.trayIcon);
     Json r = Json::o().set("ok", true).set("lines", lines).set("config", cfg);
     if (st.note.active) r.set("notify", WideToUtf8(st.note.text));
@@ -634,6 +643,8 @@ inline std::string ApplyCommand(SharedState& st, const Json& req) {
     if (req.has("align")) st.cfg.align = Utf8ToWide(req.getStr("align", "left"));
     if (req.has("material")) st.cfg.material = Utf8ToWide(req.getStr("material", "card"));
     if (req.has("renderer")) st.cfg.renderer = Utf8ToWide(req.getStr("renderer", "auto"));
+    if (req.has("bgOpacity"))
+      st.cfg.bgOpacity = (int)std::min(100.0, std::max(0.0, req.getNum("bgOpacity", 8)));
     if (req.has("trayIcon")) st.cfg.trayIcon = req.getBool("trayIcon", true);
     ReleaseSRWLockExclusive(&st.lock);
     st.dirty.store(true, std::memory_order_relaxed);

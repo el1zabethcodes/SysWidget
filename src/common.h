@@ -30,7 +30,7 @@
 constexpr const wchar_t* kPipeName   = L"\\\\.\\pipe\\SysWidget";
 constexpr const wchar_t* kMutexName  = L"Local\\SysWidget.SingleInstance";
 constexpr const wchar_t* kAppTitle   = L"SysWidget";
-constexpr const char*    kVersion    = "1.0.0";
+constexpr const char*    kVersion    = "1.1.0";
 constexpr const wchar_t* kRunKey     = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr const wchar_t* kRunValue   = L"SysWidget";
 constexpr const wchar_t* kTaskbarAdv = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
@@ -67,6 +67,8 @@ constexpr const wchar_t* kTaskbarAdv = L"Software\\Microsoft\\Windows\\CurrentVe
 #define WM_APP_HIDE       (WM_APP + 3)
 #define WM_APP_SHOW       (WM_APP + 4)
 #define WM_APP_EXIT       (WM_APP + 5)
+#define WM_APP_CFGCHANGED (WM_APP + 6)
+#define WM_APP_RAISE      (WM_APP + 7)
 
 // ---------------------------------------------------------------------------
 // Strings / conversions

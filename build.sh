@@ -22,5 +22,5 @@ echo "[build] $GPP"
   src/main.cpp -o bin/SysWidget.exe \
   -static \
   -ldwmapi -ld2d1 -ldwrite -ld3d11 -ldxgi -ldcomp \
-  -luuid -lole32 -loleaut32 -luser32 -lgdi32 -lshell32 -ladvapi32 -lshlwapi
+  -luuid -lole32 -loleaut32 -luser32 -lgdi32 -lshell32 -ladvapi32 -lshlwapi -lcomctl32 -luxtheme
 echo "[ok] bin/SysWidget.exe"

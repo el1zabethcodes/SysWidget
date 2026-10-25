@@ -9,6 +9,7 @@
 #pragma once
 #include "common.h"
 #include "content.h"
+#include "settings.h"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -89,6 +90,20 @@ inline UINT GetDpiOfWindowDyn(HWND h) {
 }
 
 // ---------------------------------------------------------------------------
+// Z-order watchdog: the taskbar (also topmost) covers our card whenever it is
+// activated; re-assert topmost instantly on foreground / z-order events.
+static HWND g_raiseCard = nullptr, g_raiseTray = nullptr;
+
+inline void CALLBACK RaiseHook(HWINEVENTHOOK, DWORD ev, HWND hwnd, LONG idObj, LONG idChild,
+                               DWORD, DWORD) {
+  if (!g_raiseCard || idObj != OBJID_WINDOW || idChild != 0) return;
+  if (ev == EVENT_SYSTEM_FOREGROUND)
+    PostMessageW(g_raiseCard, WM_APP_RAISE, 0, 0);
+  else if (ev == EVENT_OBJECT_REORDER && hwnd == g_raiseTray)
+    PostMessageW(g_raiseCard, WM_APP_RAISE, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
 struct LineView {
   std::wstring icon;
   std::wstring label;        // secondary color
@@ -156,7 +171,7 @@ class WidgetUI {
   void renderCard();
   void renderFlyout();
   void scheduleRender() { dirtyRender_.store(true, std::memory_order_relaxed); }
-  LineView buildLine(int idx, ULONGLONG now);
+  LineView buildLine(int idx, ULONGLONG now, bool withNote);
   float measure(IDWriteTextFormat* fmt, const std::wstring& text);
   void drawBar(ID2D1RenderTarget* rt, float x, float y, float w, float h, double v,
                D2D1_COLOR_F fill);
@@ -209,7 +224,6 @@ class WidgetUI {
   UINT flyW_ = 0, flyH_ = 0;
   RECT cardRect_{};
   bool cardVisible_ = false;
-  ULONGLONG lastTopmost_ = 0;
 
   // palette
   uint32_t colPrimary_ = 0xECFFFFFF, colSecondary_ = 0x9EFFFFFF;
@@ -219,8 +233,11 @@ class WidgetUI {
 
   NOTIFYICONDATAW nid_{};
   HICON trayIcon_ = nullptr;
+  SettingsUI settings_;
+  HWINEVENTHOOK hookFg_ = nullptr, hookReorder_ = nullptr;
 
-  static constexpr UINT TID_SAMPLE = 1, TID_ANIM = 2, TID_GLUE = 3, TID_TOPMOST = 4;
+  bool trayAbove(HWND tray) const;
+  static constexpr UINT TID_SAMPLE = 1, TID_ANIM = 2, TID_GLUE = 3;
 };
 
 // ---------------------------------------------------------------------------
@@ -278,16 +295,23 @@ inline HICON WidgetUI::makeTrayIcon() {
 inline void WidgetUI::palette() {
   light_ = IsLightTheme();
   colAccent_ = GetAccentArgb();
+  int op = 8;
+  if (st_) {
+    AcquireSRWLockShared(&st_->lock);
+    op = st_->cfg.bgOpacity;
+    ReleaseSRWLockShared(&st_->lock);
+  }
+  uint32_t a = (uint32_t)(std::min(100, std::max(0, op)) * 255 / 100);
   if (light_) {
     colPrimary_ = 0xE6000000;
     colSecondary_ = 0x87000000;
-    colCardBg_ = 0x0F000000;
+    colCardBg_ = a << 24;  // black tint
     colCardStroke_ = 0x12000000;
     colTrack_ = 0x1E000000;
   } else {
     colPrimary_ = 0xECFFFFFF;
     colSecondary_ = 0x9EFFFFFF;
-    colCardBg_ = 0x14FFFFFF;
+    colCardBg_ = (a << 24) | 0x00FFFFFF;  // white tint
     colCardStroke_ = 0x17FFFFFF;
     colTrack_ = 0x24FFFFFF;
   }
@@ -523,10 +547,11 @@ inline void WidgetUI::presentFly() {
 }
 
 // ---------------------------------------------------------------------------
-inline LineView WidgetUI::buildLine(int idx, ULONGLONG now) {
+inline LineView WidgetUI::buildLine(int idx, ULONGLONG now, bool withNote) {
   LineView v;
   const LineSpec& L = st_->lines[idx];
-  if (st_->note.active && idx == 0) {
+  if (L.kind == LineKind::Hidden) return v;
+  if (withNote && st_->note.active) {
     v.value = st_->note.text;
     v.valueColor = colAccent_ | 0xFF000000u;
     return v;
@@ -639,13 +664,26 @@ inline void WidgetUI::renderCard() {
 
   ULONGLONG now = GetTickCount64();
   LineView views[2];
+  bool vis[2] = {false, false};
   std::wstring material;
+  int firstVis = -1;
   {
     AcquireSRWLockShared(&st_->lock);
-    views[0] = buildLine(0, now);
-    views[1] = buildLine(1, now);
     material = st_->cfg.material;
+    for (int i = 0; i < 2; i++) {
+      vis[i] = st_->lines[i].kind != LineKind::Hidden;
+      if (vis[i] && firstVis < 0) firstVis = i;
+    }
+    for (int i = 0; i < 2; i++)
+      if (vis[i]) views[i] = buildLine(i, now, i == firstVis);
     ReleaseSRWLockShared(&st_->lock);
+  }
+  if (!vis[0] && !vis[1]) {
+    if (cardVisible_) {
+      ShowWindow(card_, SW_HIDE);
+      cardVisible_ = false;
+    }
+    return;
   }
 
   rt->BeginDraw();
@@ -654,7 +692,12 @@ inline void WidgetUI::renderCard() {
   float W = (float)cardW_, H = (float)cardH_;
   float corner = 6.f * scale_;
   if (material != L"flat") {
-    uint32_t bg = hoverCard_ ? (colCardBg_ + 0x0A000000) : colCardBg_;
+    uint32_t bg = colCardBg_;
+    if (hoverCard_) {
+      uint32_t al = (bg >> 24) + 10;
+      if (al > 255) al = 255;
+      bg = (al << 24) | (bg & 0xFFFFFF);
+    }
     br->SetColor(ArgbToColor(bg));
     rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, W, H), corner, corner), br);
     br->SetColor(ArgbToColor(colCardStroke_));
@@ -664,12 +707,16 @@ inline void WidgetUI::renderCard() {
 
   float padX = 10.f * scale_;
   float padY = 4.f * scale_;
-  float lineH = (H - 2 * padY) / 2.f;
+  int nVis = (vis[0] ? 1 : 0) + (vis[1] ? 1 : 0);
+  float lineH = (H - 2 * padY) / (float)(nVis > 0 ? nVis : 1);
   float iconSize = 11.f * scale_;
+  int row = 0;
 
   for (int i = 0; i < 2; i++) {
+    if (!vis[i]) continue;
     LineView& v = views[i];
-    float yTop = padY + i * lineH;
+    float yTop = padY + row * lineH;
+    row++;
     float right = W - padX;
     float x = padX;
 
@@ -731,8 +778,8 @@ inline void WidgetUI::renderFlyout() {
   bool customLine[2] = {false, false};
   {
     AcquireSRWLockShared(&st_->lock);
-    views[0] = buildLine(0, NowMs());
-    views[1] = buildLine(1, NowMs());
+    views[0] = buildLine(0, NowMs(), true);
+    views[1] = buildLine(1, NowMs(), false);
     cpu = st_->histCpu;
     ram = st_->histRam;
     stats = st_->stats;
@@ -829,6 +876,15 @@ inline void WidgetUI::renderFlyout() {
 }
 
 // ---------------------------------------------------------------------------
+bool WidgetUI::trayAbove(HWND tray) const {
+  HWND h = GetWindow(card_, GW_HWNDPREV);
+  for (int i = 0; h && i < 64; i++) {
+    if (h == tray) return true;
+    h = GetWindow(h, GW_HWNDPREV);
+  }
+  return false;
+}
+
 inline void WidgetUI::glue(bool force) {
   HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
   if (!tray) {
@@ -836,6 +892,7 @@ inline void WidgetUI::glue(bool force) {
     if (flyOpen_) toggleFlyout(false);
     return;
   }
+  g_raiseTray = tray;
   RECT tr{};
   GetWindowRect(tray, &tr);
   HMONITOR mon = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
@@ -886,17 +943,20 @@ inline void WidgetUI::glue(bool force) {
   }
 
   RECT want{x, y, x + (int)wantW, y + (int)wantH};
-  bool moved =
-      force || !EqualRect(&want, &cardRect_) || !cardVisible_ || wantW != cardW_ || wantH != cardH_;
+  RECT cur{};
+  bool haveCur = GetWindowRect(card_, &cur) != FALSE;
+  // compare against the ACTUAL window rect so external shifts/DPI/monitor
+  // changes are always corrected (adaptive positioning)
+  bool moved = force || !haveCur || !EqualRect(&want, &cur) || !cardVisible_ ||
+               wantW != cardW_ || wantH != cardH_;
 
   if (moved) {
     cardW_ = wantW;
     cardH_ = wantH;
     SetWindowPos(card_, HWND_TOPMOST, x, y, (int)wantW, (int)wantH,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    cardRect_ = want;
+    GetWindowRect(card_, &cardRect_);
     cardVisible_ = true;
-    lastTopmost_ = NowMs();
     if (useDcomp() && csc_ && wantW && wantH) {
       cctx_->SetTarget(nullptr);
       cbmp_.reset();
@@ -918,11 +978,11 @@ inline void WidgetUI::glue(bool force) {
     scheduleRender();
   }
 
-  if (NowMs() - lastTopmost_ > 5000) {
+  // raise above the taskbar only when it actually covers us (cheap z-order check)
+  if (cardVisible_ && trayAbove(tray)) {
     SetWindowPos(card_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     if (flyOpen_ && fly_)
       SetWindowPos(fly_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    lastTopmost_ = NowMs();
   }
 
   if (flyOpen_ && fly_ && moved) {
@@ -986,6 +1046,7 @@ inline void WidgetUI::toggleFlyout(bool open) {
 inline void WidgetUI::trayMenu() {
   SetForegroundWindow(card_);
   HMENU m = CreatePopupMenu();
+  AppendMenuW(m, MF_STRING, 1006, L"Настройки…");
   AppendMenuW(m, MF_STRING, 1001, flyOpen_ ? L"Скрыть сводку" : L"Сводка (графики)");
   AppendMenuW(m, MF_STRING, 1002, L"Сбросить строки (CPU/RAM)");
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -1000,6 +1061,9 @@ inline void WidgetUI::trayMenu() {
                            card_, nullptr);
   DestroyMenu(m);
   switch (cmd) {
+    case 1006:
+      settings_.open(st_, card_);
+      break;
     case 1001:
       toggleFlyout(!flyOpen_);
       break;
@@ -1041,8 +1105,10 @@ inline bool WidgetUI::create(SharedState& st) {
     else backend_ = L"gdi";  // auto -> most compatible
   }
 
-  DWORD exCard = useDcomp() ? (WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
-                            : (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+  DWORD exCard = useDcomp()
+                     ? (WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                        WS_EX_TOPMOST)
+                     : (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST);
   WNDCLASSW wc{};
   wc.lpfnWndProc = CardProc;
   wc.hInstance = GetModuleHandleW(nullptr);
@@ -1068,7 +1134,13 @@ inline bool WidgetUI::create(SharedState& st) {
   SetTimer(card_, TID_SAMPLE, 1000, nullptr);
   SetTimer(card_, TID_ANIM, 100, nullptr);
   SetTimer(card_, TID_GLUE, 1000, nullptr);
-  SetTimer(card_, TID_TOPMOST, 5000, nullptr);
+
+  g_raiseCard = card_;
+  g_raiseTray = FindWindowW(L"Shell_TrayWnd", nullptr);
+  hookFg_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+                            RaiseHook, 0, 0, WINEVENT_OUTOFCONTEXT);
+  hookReorder_ = SetWinEventHook(EVENT_OBJECT_REORDER, EVENT_OBJECT_REORDER, nullptr,
+                                 RaiseHook, 0, 0, WINEVENT_OUTOFCONTEXT);
 
   if (st.cfg.trayIcon) {
     trayIcon_ = makeTrayIcon();
@@ -1148,16 +1220,6 @@ inline LRESULT WidgetUI::cardHandler(UINT msg, WPARAM wp, LPARAM lp) {
         case TID_GLUE:
           glue(false);
           break;
-        case TID_TOPMOST:
-          if (cardVisible_) {
-            SetWindowPos(card_, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            if (flyOpen_ && fly_)
-              SetWindowPos(fly_, HWND_TOPMOST, 0, 0, 0, 0,
-                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            lastTopmost_ = NowMs();
-          }
-          break;
       }
       return 0;
 
@@ -1196,7 +1258,26 @@ inline LRESULT WidgetUI::cardHandler(UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
 
     case WM_LBUTTONUP:
-      toggleFlyout(!flyOpen_);
+      settings_.open(st_, card_);
+      return 0;
+
+    case WM_APP_RAISE: {
+      if (!cardVisible_) return 0;
+      HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+      if (tray && trayAbove(tray))
+        SetWindowPos(card_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+      return 0;
+    }
+
+    case WM_APP_CFGCHANGED:
+      glue(true);
+      renderCard();
+      return 0;
+
+    case WM_DISPLAYCHANGE:
+    case WM_SETTINGCHANGE:
+      glue(true);
       return 0;
 
     case WM_APP_HIDE:
@@ -1238,6 +1319,11 @@ inline LRESULT WidgetUI::cardHandler(UINT msg, WPARAM wp, LPARAM lp) {
       if (trayAdded_) Shell_NotifyIconW(NIM_DELETE, &nid_);
       if (trayIcon_) DestroyIcon(trayIcon_);
       toggleFlyout(false);
+      settings_.requestClose();
+      if (hookFg_) UnhookWinEvent(hookFg_);
+      if (hookReorder_) UnhookWinEvent(hookReorder_);
+      hookFg_ = hookReorder_ = nullptr;
+      g_raiseCard = nullptr;
       st_->quit.store(true, std::memory_order_relaxed);
       PostQuitMessage(0);
       return 0;
